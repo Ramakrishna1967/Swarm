@@ -2,14 +2,14 @@
 
 ## Context
 
-`swarm` orchestrates 2–6 parallel Claude coding agents on isolated git worktrees and detects **interface contract conflicts** between their in-flight changes before merge. The failure mode it targets: agent A changes `authenticate(user)` → `authenticate(user, scope)`; agent B, isolated, writes a call to the old one-arg form. Both worktrees are internally consistent, both pass their own tests, git sees no textual conflict, the merge succeeds, the bug is silent until runtime.
+`swarm` orchestrates 2–6 parallel LLM coding agents on isolated git worktrees and detects **interface contract conflicts** between their in-flight changes before merge. The failure mode it targets: agent A changes `authenticate(user)` → `authenticate(user, scope)`; agent B, isolated, writes a call to the old one-arg form. Both worktrees are internally consistent, both pass their own tests, git sees no textual conflict, the merge succeeds, the bug is silent until runtime.
 
 Existing tools solve parallel execution and task-level coordination. None diff function *shape* across concurrently-modified branches. That gap is the whole product.
 
 Two notes on state before the design:
 
 - **`D:\projects\Swarm` is empty.** The prototype described in the brief (`models.py`, `interfaces.py`, `conflicts.py`, `git_ops.py`) is not on disk and is not a git repo. Everything below is greenfield; the prototype is treated as a design sketch to critique, which is how it was offered.
-- **Confirmed decisions:** sub-agents are driven by swarm's own Anthropic API tool-use loop (not `claude -p` subprocess); this turn's deliverable is the design only, no implementation.
+- **Confirmed decisions:** sub-agents are driven by swarm's own deterministic tool-use loop through a swappable `Transport` backend (`--provider openai|groq|openrouter|ollama|lmstudio|anthropic`), not a vendor CLI subprocess; this turn's deliverable is the design only, no implementation.
 
 Assumptions are tagged **[A]** throughout so they can be challenged.
 
@@ -17,7 +17,7 @@ Assumptions are tagged **[A]** throughout so they can be challenged.
 
 ## 1. System Overview
 
-`swarm run` decomposes a goal into N tasks, creates one git worktree + branch per task off a frozen base commit, and drives each task with an independent Anthropic tool-use loop. Every file write triggers debounced AST extraction into a per-agent *interface contract*. A detector diffs those contracts **against the base commit** — not against each other — which is what makes concurrent unordered edits tractable. Confirmed conflicts are surfaced live in a TUI and, for the asymmetric case, injected into the other agent's next turn as a mid-conversation system message so it can self-correct. At the end the user gets a merge decision with per-conflict remediation options. swarm never edits code itself and never touches the user's branch.
+`swarm run` decomposes a goal into N tasks, creates one git worktree + branch per task off a frozen base commit, and drives each task with an independent model tool-use loop through the selected provider's `Transport`. Every file write triggers debounced AST extraction into a per-agent *interface contract*. A detector diffs those contracts **against the base commit** — not against each other — which is what makes concurrent unordered edits tractable. Confirmed conflicts are surfaced live in a TUI and, for the asymmetric case, injected into the other agent's next turn as a mid-conversation system message so it can self-correct. At the end the user gets a merge decision with per-conflict remediation options. swarm never edits code itself and never touches the user's branch.
 
 ```
  swarm run "goal" --agents 4
@@ -86,14 +86,15 @@ Tasks come from `--task` repeated (explicit, preferred), or from one decompositi
 
 ```python
 def decompose(goal: str, n: int, repo_map: str) -> list[Task]
-# claude-opus-5, output_config.format = json_schema:
+# provider model with json_schema-structured output, e.g.
+# openai "gpt-4o-mini" / groq "llama-3.3-70b-versatile" / anthropic "claude-opus-5":
 #   {tasks: [{id, title, instructions, expected_paths: [str]}]}
 # `expected_paths` is advisory only — used for scheduling hints and to warn on
 # heavy overlap. It is NOT enforced; enforcement would just re-invent
 # task-level coordination, which is a non-goal.
 ```
 
-**Failure modes.** Dirty working tree at start (refuse — a dirty tree makes the base ambiguous); `--base` not an ancestor of HEAD (warn, proceed); decomposition returns overlapping or degenerate tasks (show the split, require confirmation unless `--yes`); `stop_reason == "refusal"` on the decomposition call (surface and fall back to `--task` prompting).
+**Failure modes.** Dirty working tree at start (refuse — a dirty tree makes the base ambiguous); `--base` not an ancestor of HEAD (warn, proceed); decomposition returns overlapping or degenerate tasks (show the split, require confirmation unless `--yes`); the method call refuses output (surface and fall back to `--task` prompting).
 
 ### 2.2 Orchestrator
 
@@ -106,12 +107,12 @@ class Orchestrator:
     async def cancel(self, reason: str) -> None # cooperative, then hard
 ```
 
-Structure: one `asyncio.Task` per agent, a single `GitExecutor` for index-mutating git ops, an `ApiAdmission` gate in front of every Anthropic call, and an `EventBus` that is the *only* channel to the TUI.
+Structure: one `asyncio.Task` per agent, a single `GitExecutor` for index-mutating git ops, an `ApiAdmission` gate in front of every provider request, and an `EventBus` that is the *only* channel to the TUI.
 
 **API admission control.** All N agents share one org rate-limit bucket, so uncoordinated fan-out means 429 storms.
 
 - A semaphore caps in-flight requests (default `min(agents, 4)`).
-- A token bucket sized from the `anthropic-ratelimit-*` response headers, refreshed on every response; requests wait for capacity rather than discovering it via 429.
+- A token bucket sized from the provider's `*-ratelimit-*` response headers (e.g. `anthropic-ratelimit-*`), refreshed on every response; requests wait for capacity rather than discovering it via 429.
 - SDK retries raised from the default 2 to 8, with jitter; `retry-after` honored verbatim on 429.
 - **Cache-warm-then-fan-out.** All agents share a byte-identical prompt prefix (§2.3). Concurrent requests with the same prefix *all* miss, because an entry is only readable once the first response begins streaming. So: fire one warmup request (`max_tokens=0` against the shared prefix), await first byte, then release the fleet. One cache write instead of N.
 
@@ -123,7 +124,7 @@ Structure: one `asyncio.Task` per agent, a single `GitExecutor` for index-mutati
 
 One per agent. Owns the conversation, the tool loop, and the token budget.
 
-**Loop shape.** Use the SDK's beta tool runner (`client.beta.messages.tool_runner`) rather than a hand-written `while stop_reason == "tool_use"` loop. The runner's per-turn hooks give exactly the interception points needed — the extraction trigger lives *inside* the `write_file` tool function, and the settle/inject decisions live between iterations. A manual loop would buy nothing here.
+**Loop shape.** The Transport interface (§2.2) turns the LLM into a typed contract for swarm: canonical OpenAI chat-completions messages and a canonical tool list. Each backend adapter (`OpenAICompatTransport` for OpenAI/Groq/OpenRouter/Ollama/vLLM via stdlib HTTP, `AnthropicTransport` for the Anthropic Messages API, `MockTransport` for tests) translates to its own wire format. The loop itself is a hand-written `while tool_calls present` loop — see `runner.py` — with the extraction trigger living *inside* the `write_file` tool function and the settle/inject decisions between iterations.
 
 ```python
 @beta_tool
@@ -144,19 +145,20 @@ def report_done(summary: str, files_changed: list[str]) -> str: ...
 
 `run_shell` is the escape hatch (tests, linters, `git`); the dedicated file tools exist because swarm needs a typed hook on writes, which an opaque shell string cannot provide. Every `path` is resolved to its canonical form and rejected unless it stays under the agent's worktree root — the sandbox boundary, non-negotiable.
 
-**"Done" is a tool call, not a heuristic.** `report_done` is explicit and unambiguous; a turn ending without tool use is treated as a *turn boundary* (the settle signal, §3), not as completion. Belt-and-braces stops: `max_iterations` (default 40), a `task_budget` (beta `task-budgets-2026-03-13`, minimum 20k), and a wall-clock ceiling.
+**"Done" is a tool call, not a heuristic.** `report_done` is explicit and unambiguous; a turn ending without tool use is treated as a *turn boundary* (the settle signal, §3), not as completion. Belt-and-braces stops: `max_iterations` (default 40), a token `task_budget`, and a wall-clock ceiling.
 
-**Model config** (per the current API surface, not from memory):
+**Model config.** Provider- and model-dependent — selected via `--provider`/`--model` (or `SWARM_PROVIDER`/`SWARM_MODEL`). Reasonable defaults per provider:
 
 ```python
-model="claude-opus-5"
-output_config={"effort": "xhigh"}        # agentic coding; sweep down per repo
-thinking={"type": "adaptive"}            # on by default on Opus 5 anyway
-max_tokens=64000                         # xhigh needs headroom; stream at this size
-stream=True                              # required above ~16k
+# OpenAI / OpenAI-compatible (OpenAICompatTransport)
+provider="openai"; model="gpt-4o-mini"; max_tokens=64000
+# Groq  provider="groq";  model="llama-3.3-70b-versatile"
+# Ollama provider="ollama"; model="qwen2.5-coder:latest"   # keyless, localhost
+# Anthropic (AnthropicTransport)
+provider="anthropic"; model="claude-opus-5"; thinking_effort high; max_tokens=64000
 ```
 
-Handle `stop_reason == "refusal"` before reading `content` (Opus 5 ships elevated cyber safeguards; a security-adjacent task can trip them) and opt into `fallbacks: "default"` with beta `server-side-fallback-2026-07-01`.
+Where a provider runs elevated safety guards and can refuse a turn, check the refusal before reading `content`, surface it, and do not retry blindly.
 
 **Prompt caching design.** All agents share one prefix, so the cache pays N-fold.
 
@@ -164,13 +166,13 @@ Handle `stop_reason == "refusal"` before reading `content` (Opus 5 ships elevate
 |---|---|---|
 | `tools` | fixed tool list, sorted by name | frozen for the run |
 | `system[0]` | agent instructions, contract-awareness rules | frozen |
-| `system[1]` | repo map + base commit digest, `cache_control` breakpoint here | frozen per run |
+| `system[1]` | repo map + base commit digest, provider cache breakpoint here | frozen per run |
 | `messages[0]` | this agent's task | per-agent |
 | `messages[n]` | turns, tool results | per-turn |
 
-No timestamps, no run IDs, no agent IDs, no `datetime.now()` anywhere in `system`. Tools rendered in sorted order. Peer-contract injections go in as `{"role": "system"}` **messages** (supported on Opus 5, no beta header) — appending after the cached history preserves the prefix, where editing top-level `system` would re-bill every prior turn. Verify with `usage.cache_read_input_tokens`; if it is zero across turns, something in the prefix is varying.
+No timestamps, no run IDs, no agent IDs, no `datetime.now()` anywhere in `system`. Tools rendered in sorted order. Peer-contract injections go in as `{"role": "system"}` **messages** — appending after the cached history preserves the prefix, where editing top-level system would re-bill every prior turn. Verify with the provider's cached-token usage (e.g. `usage.cache_read_input_tokens` on Anthropic, `prompt_cache_hit_tokens` on DeepSeek, `prompt_tokens_details.cached_tokens` on OpenAI-compatible); if it stays zero across turns, something in the prefix is varying.
 
-**Failure modes.** Rate limit / timeout → admission gate + SDK retry, agent state `THROTTLED`, no work lost. Tool exception → return `is_error: true` so the model adapts, never crash the loop. `run_shell` hang → timeout, truncated output. Context growth → beta compaction (`compact-2026-01-12`), appending full `response.content` so compaction blocks survive. Model loops on one file → `max_iterations` trips, state `EXHAUSTED`, partial work preserved on the branch.
+**Failure modes.** Rate limit / timeout → admission gate + backend retry, agent state `THROTTLED`, no work lost. Tool exception → return an error so the model adapts, never crash the loop. `run_shell` hang → timeout, truncated output. Context growth → provider-managed or agent-side compaction of the transcript, appending the full response so nothing is lost. Model loops on one file → `max_iterations` trips, state `EXHAUSTED`, partial work preserved on the branch.
 
 ### 2.4 Worktree Manager
 
@@ -344,7 +346,7 @@ Remediation by kind:
 | `RUNNING` | `SETTLING` | assistant turn ends with no `tool_use` |
 | `SETTLING` | `RUNNING` | next user/system message sent (repair injection or continuation) |
 | `SETTLING` | `DONE` | `report_done` called |
-| `RUNNING` | `THROTTLED` | 429 / timeout inside admission or SDK retry |
+| `RUNNING` | `THROTTLED` | 429 / timeout inside admission or backend retry |
 | `THROTTLED` | `RUNNING` | retry succeeds |
 | `THROTTLED` | `FAILED` | retries exhausted |
 | `RUNNING` | `EXHAUSTED` | `max_iterations`, task budget, or wall-clock ceiling hit |
@@ -552,9 +554,9 @@ Growth beyond ~10 agents would need the extraction pool moved to a process pool 
 | Scenario | Detection | Recovery |
 |---|---|---|
 | Agent process/task crashes mid-task | per-agent `asyncio.Task` exception; run continues | state `FAILED`; work up to the last settled checkpoint is on the branch; worktree retained; other agents unaffected; branch still mergeable |
-| API rate limit (429) | admission token bucket, then SDK retry with `retry-after` | state `THROTTLED`; exponential backoff + jitter, 8 retries; conversation state intact so no work is lost; TUI shows countdown |
+| API rate limit (429) | admission token bucket, then backend retry with `retry-after` | state `THROTTLED`; exponential backoff + jitter on the backend; conversation state intact so no work is lost; TUI shows countdown |
 | API timeout / connection error | `APITimeoutError` / `APIConnectionError` | same retry path; if the last turn's tool calls already ran, the assistant turn is re-requested — tools are idempotent by design (`write_file` is a full overwrite) |
-| `stop_reason == "refusal"` | checked **before** reading `content` | `fallbacks: "default"` retries server-side on Opus 4.8; if the chain refuses, surface the task and the category, mark `FAILED`, do not retry blindly |
+| The output call prefers `stop_reason == "refusal"`-style refusals | checked **before** reading `content` | surface the refusal and the task, mark `FAILED`, do not retry blindly |
 | Model loops / burns budget | `max_iterations`, `task_budget`, wall-clock ceiling | state `EXHAUSTED`; partial work checkpointed and mergeable; TUI flags it distinctly from `FAILED` |
 | Git worktree corruption / stale admin entry | `swarm doctor` diffs manifest against `git worktree list --porcelain` | dir with commits → keep branch, offer dir prune; dir clean → prune; manifest-only entry → clear; unexpected `swarm/*` branch → report, never delete |
 | `index.lock` contention | git exits non-zero with a lock message | serialized git executor makes it near-impossible by construction; residual case retries with backoff up to 5s, then surfaces |
@@ -730,4 +732,4 @@ No implementation this turn. When v1 is built, the end-to-end check is:
 2. **Unit tests on `accepts` and `relation`.** Property-based (`hypothesis`) over generated `Shape`/`CallSite` pairs, asserting the lattice laws: `relation(s, s) == IDENTICAL`; `WIDENED` implies every call `accepts`-ed by old is `accepts`-ed by new; `relation` is antisymmetric between `WIDENED` and `NARROWED`. These two functions are the whole algorithm — they get the most test weight.
 3. **False-positive corpus.** Extract contracts from 10 real repos at two adjacent commits each and assert zero conflicts where the real commit was backward-compatible. Precision is the metric that decides adoption.
 4. **Crash-recovery test.** `SIGKILL` the orchestrator mid-run, then `swarm doctor` must reconcile with zero orphaned worktrees and zero lost branches. Repeat with `ENOSPC` injected.
-5. **Live run on a real repo.** 3 agents, real Anthropic API, real worktrees; verify `usage.cache_read_input_tokens > 0` from the second agent onward (proving the shared-prefix cache design works), no 429 storms, and a merge that produces an integration branch whose tests pass.
+5. **Live run on a real repo.** 3 agents, any live provider key, real worktrees; verify the shared-prefix cache helps (provider cache-read tokens stay high from the second agent onward), no 429 storms, and a merge that produces an integration branch whose tests pass.

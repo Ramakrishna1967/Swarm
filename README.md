@@ -22,11 +22,35 @@ python -m pytest tests -q          # run the test suite
 python -m swarm --version
 ```
 
+## Providers
+
+swarm drives agents through whatever LLM you point it at. Two real backends
+ship, both built so no third-party package is required:
+
+| Provider | Key env var | Notes |
+|---|---|---|
+| OpenAI | `OPENAI_API_KEY` | default; `gpt-4o-mini` by default |
+| Groq | `GROQ_API_KEY` | fast llama models |
+| OpenRouter | `OPENROUTER_API_KEY` | one key, many models |
+| Ollama | — (localhost) | keyless, runs locally |
+| LM Studio | — (localhost) | keyless, runs locally |
+| Anthropic | `ANTHROPIC_API_KEY` | Claude tool-use |
+
+Any other OpenAI-compatible endpoint (`--base-url`) works the same way.
+Select with `--provider`, override the model with `--model`, override the
+endpoint with `--base-url`, cap each turn's output with `--max-tokens`
+(default 16384, provider-safe for gpt-4o-mini/Groq), or pass a key
+explicitly with `--api-key` (reads the provider's env var by default).
+`SWARM_PROVIDER`, `SWARM_MODEL`, `SWARM_BASE_URL`, `SWARM_MAX_TOKENS`
+set the same options via env for library users of `Orchestrator`. `--mock`
+drives agents with a no-op `MockTransport` instead of calling any API.
+
 ## CLI
 
 ```
 python -m swarm run "goal" --agents 4 --system "custom prompt"
 python -m swarm run --task auth="..." --task ui="..." --mock
+python -m swarm run "goal" --provider groq --model llama-3.3-70b-versatile
 python -m swarm status <run_id>
 python -m swarm conflicts <run_id>        # exit 1 if any HIGH conflict
 python -m swarm merge <run_id>            # build swarm/<run_id>/integration
@@ -37,8 +61,7 @@ python -m swarm abort <run_id>
 python -m swarm log <run_id>
 ```
 
-Read-only commands accept `--json` for scripting. `run --mock` drives agents
-with a no-op MockTransport instead of the real Anthropic tool loop.
+Read-only commands accept `--json` for scripting.
 
 ## Library surface
 
@@ -50,7 +73,7 @@ with a no-op MockTransport instead of the real Anthropic tool loop.
 - `store.py` — `ContractStore`: debounced extraction, syntax-error fallback
 - `events.py` — thread-safe JSONL `EventBus` + `fold_status`
 - `admission.py` — semaphore + token-bucket admission control
-- `transport.py` — `Transport`, `AnthropicTransport`, `MockTransport`
+- `transport.py` — `Transport`, `OpenAICompatTransport` (OpenAI/Groq/OpenRouter/Ollama/vLLM via stdlib HTTP), `AnthropicTransport`, `MockTransport`
 - `gitops.py` — `GitExecutor`, per-worktree manifests, `WorktreeManager`, `doctor()`
 - `runner.py` — agent tool loop, sandbox, settle signal, cancellation
 - `orchestrator.py` — worktrees + branches, concurrent runs, checkpointing,
@@ -64,5 +87,6 @@ with a no-op MockTransport instead of the real Anthropic tool loop.
 - Contract extraction, resolution, conflict detection, orchestrator, merge, and
   CLI are implemented and covered by unit + end-to-end tests (real temp git
   repo with mock agents).
-- `AnthropicTransport` is written but only verified against a live key; run with
-  `--mock` to exercise the orchestration without one.
+- The live backends (`OpenAICompatTransport`, `AnthropicTransport`) are written
+  but only verified against a live key. Use `--mock` to exercise the
+  orchestration without one.

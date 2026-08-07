@@ -148,3 +148,36 @@ def test_self_evolution_is_not_broken_caller_for_method_owner():
     base = {key("S.m"): base_shape(("self",), 1, is_method=True, implicit_self=True)}
     agents = {"A": defn("S.m", base_shape(("self", "z"), 1, is_method=True, implicit_self=True))}
     assert detect(base, agents) == []
+
+
+def test_broken_caller_carries_was_now_shapes():
+    base = {key("authenticate"): base_shape(("user",), 1)}
+    agents = {
+        "A": defn("authenticate", base_shape(("user", "scope"), 2)),
+        "B": caller("authenticate", n_positional=1),
+    }
+    c = detect(base, agents)[0]
+    assert c.a == "(user)"
+    assert c.b == "(user, scope)"
+
+
+def test_divergent_def_carries_both_shapes():
+    base = {key("get"): base_shape(("self", "key"), 2)}
+    agents = {
+        "B": defn("get", base_shape(("self", "key", "default"), 2)),
+        "D": defn("get", base_shape(("self", "key"), 2, kw_required={"ttl"})),
+    }
+    kinds = [c.kind for c in detect(base, agents)]
+    assert ConflictKind.DIVERGENT_DEF in kinds
+    div = next(c for c in detect(base, agents) if c.kind == ConflictKind.DIVERGENT_DEF)
+    assert div.a and div.b
+    assert div.a != div.b
+
+
+def test_removed_symbol_carries_old_shape():
+    base = {key("gone"): base_shape(("x",), 1)}
+    agents = {"B": caller("gone", n_positional=1)}
+    c = detect(base, agents)[0]
+    assert c.kind == ConflictKind.REMOVED_SYMBOL
+    assert c.a == "(x)"
+    assert c.b is None

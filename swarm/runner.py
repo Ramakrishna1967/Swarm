@@ -10,19 +10,22 @@ unit of work by its own judgment.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from .admission import Admission
 from .models import RunResult
 from .store import ContractStore
-from .transport import ToolCall, TurnResult
+from .transport import (
+    RateLimitError, RetryableTransportError, ToolCall, TransportError, TurnResult,
+)
 
 TOOL_NAMES = [
     "list_dir", "read_file", "write_file", "edit_file",
@@ -119,24 +122,29 @@ class Agent:
             self.messages.append({"role": "system", "content": content})
 
     def tool_schema(self) -> list[dict]:
-        def schema(name, desc, properties, required):
+        """The tool list in the canonical OpenAI function shape; each backend
+        converts it to its own wire format."""
+        def fn(name, desc, properties, required):
             return {
-                "name": name, "description": desc,
-                "input_schema": {"type": "object", "properties": properties, "required": required},
+                "type": "function",
+                "function": {
+                    "name": name, "description": desc,
+                    "parameters": {"type": "object", "properties": properties, "required": required},
+                },
             }
         return [
-            schema("read_file", "read a file from the worktree",
-                   {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}}, ["path"]),
-            schema("write_file", "write a whole file (overwrites)",
-                   {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
-            schema("edit_file", "replace an old string with new in a file",
-                   {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, ["path", "old", "new"]),
-            schema("list_dir", "list a directory", {"path": {"type": "string"}, "depth": {"type": "integer"}}, ["path"]),
-            schema("grep", "search file contents", {"pattern": {"type": "string"}, "glob": {"type": "string"}}, ["pattern"]),
-            schema("run_shell", "run a shell command (tests, lint, git)",
-                   {"command": {"type": "string"}, "timeout_s": {"type": "integer"}}, ["command"]),
-            schema("report_done", "declare the task complete",
-                   {"summary": {"type": "string"}, "files_changed": {"type": "array", "items": {"type": "string"}}}, ["summary"]),
+            fn("read_file", "read a file from the worktree",
+               {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}}, ["path"]),
+            fn("write_file", "write a whole file (overwrites)",
+               {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+            fn("edit_file", "replace an old string with new in a file",
+               {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, ["path", "old", "new"]),
+            fn("list_dir", "list a directory", {"path": {"type": "string"}, "depth": {"type": "integer"}}, ["path"]),
+            fn("grep", "search file contents", {"pattern": {"type": "string"}, "glob": {"type": "string"}}, ["pattern"]),
+            fn("run_shell", "run a shell command (tests, lint, git)",
+               {"command": {"type": "string"}, "timeout_s": {"type": "integer"}}, ["command"]),
+            fn("report_done", "declare the task complete",
+               {"summary": {"type": "string"}, "files_changed": {"type": "array", "items": {"type": "string"}}}, ["summary"]),
         ]
 
     # -- tool implementations -----------------------------------------------
@@ -226,13 +234,34 @@ class Agent:
                 result: TurnResult = self.transport.turn(
                     self.build_messages(), self.tool_schema(),
                 )
-            except Exception:
+            except RateLimitError as exc:
+                self.admission.release()
+                self.state = "THROTTLED"
+                self.emit(kind="agent_state", agent=self.name, state="THROTTLED",
+                          turn=self.turn, retry_after=exc.retry_after)
+                time.sleep(min(exc.retry_after or 1.0, 30.0))
+                continue
+            except RetryableTransportError:
+                self.admission.release()
                 self.state = "THROTTLED"
                 self.emit(kind="agent_state", agent=self.name, state="THROTTLED", turn=self.turn)
                 time.sleep(1.0)
                 continue
-            finally:
+            except TransportError as exc:
+                # auth / bad request / anything 4xx is not going to recover on
+                # a retry; failing fast beats burning the whole iteration budget.
                 self.admission.release()
+                self.state = "FAILED"
+                self.emit(kind="agent_state", agent=self.name, state="FAILED",
+                          turn=self.turn, error=str(exc)[:300])
+                break
+            except Exception as exc:
+                self.admission.release()
+                self.state = "FAILED"
+                self.emit(kind="agent_state", agent=self.name, state="FAILED",
+                          turn=self.turn, error=str(exc)[:300])
+                break
+            self.admission.release(result.rate_rpm)
 
             self.total_input_tokens += result.usage.input_tokens
             self.total_output_tokens += result.usage.output_tokens
@@ -258,7 +287,11 @@ class Agent:
             done = False
             for call in result.tool_calls:
                 self.messages.append({
-                    "role": "assistant", "content": call.name, "tool_call_id": call.id,
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{
+                        "id": call.id, "type": "function",
+                        "function": {"name": call.name, "arguments": json.dumps(call.inputs)},
+                    }],
                 })
                 if call.name == "report_done":
                     res = self._call_tool(call)

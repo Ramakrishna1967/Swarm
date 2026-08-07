@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -57,10 +58,58 @@ def _branches(run: Path) -> dict[str, str]:
 
 
 # ---- run ---------------------------------------------------------------------
+# Known OpenAI-compatible providers (base_url / key env var / default model).
+PROVIDERS: dict[str, dict] = {
+    "openai": {"base_url": "https://api.openai.com/v1", "key_env": "OPENAI_API_KEY",
+               "model": "gpt-4o-mini"},
+    "groq": {"base_url": "https://api.groq.com/openai/v1", "key_env": "GROQ_API_KEY",
+             "model": "llama-3.3-70b-versatile"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY",
+                   "model": "openai/gpt-4o-mini"},
+    "ollama": {"base_url": "http://localhost:11434/v1", "key_env": None,
+               "model": "qwen2.5-coder:latest"},
+    "lmstudio": {"base_url": "http://localhost:1234/v1", "key_env": None,
+                 "model": "qwen2.5-coder"},
+    "anthropic": {"base_url": None, "key_env": "ANTHROPIC_API_KEY",
+                  "model": "claude-opus-5"},
+}
+
+
+def _live_transport(args) -> object:
+    """Build the live transport for the requested provider; raises on a
+    missing key or unknown provider. ``args.max_tokens`` (or the transport
+    default) caps each turn's output tokens."""
+    from .transport import AnthropicTransport, OpenAICompatTransport, TransportError
+
+    provider = (args.provider or os.environ.get("SWARM_PROVIDER", "openai")).lower()
+    spec = PROVIDERS.get(provider)
+    if spec is None:
+        raise ValueError(
+            f"unknown provider {provider!r}; choose from {', '.join(sorted(PROVIDERS))}")
+    model = args.model or os.environ.get("SWARM_MODEL") or spec["model"]
+    api_key = args.api_key or (os.environ.get(spec["key_env"])
+                               if spec["key_env"] else None)
+    max_tokens = args.max_tokens or int(os.environ.get("SWARM_MAX_TOKENS") or 0) or None
+    if provider == "anthropic":
+        if not api_key:
+            raise ValueError(
+                "anthropic needs ANTHROPIC_API_KEY (or --api-key)")
+        return AnthropicTransport(model=model, api_key=api_key,
+                                  **{"max_tokens": max_tokens} if max_tokens else {})
+    base_url = args.base_url or os.environ.get("SWARM_BASE_URL") or spec["base_url"]
+    if api_key is None and "localhost" not in base_url and "127.0.0.1" not in base_url:
+        raise ValueError(
+            f"{provider} needs {spec['key_env']} (or --api-key); "
+            "keyless endpoints (ollama/lmstudio) run against localhost")
+    return OpenAICompatTransport(model=model, base_url=base_url, api_key=api_key,
+                                 **{"max_tokens": max_tokens} if max_tokens else {})
+
+
 def cmd_run(args) -> int:
     from .models import Task
     from .orchestrator import Orchestrator
-    from .transport import AnthropicTransport, MockTransport
+    from .transport import MockTransport
+    from .transport import TransportError
 
     repo = Path(args.repo).resolve()
     if args.tasks:
@@ -76,11 +125,19 @@ def cmd_run(args) -> int:
         print("provide GOAL or --task", file=sys.stderr)
         return 2
 
-    def factory(_name: str):
-        if args.mock:
+    if args.mock:
+        def factory(_name: str):
             return MockTransport([{"tool": "report_done",
                                    "inputs": {"summary": "no-op", "files_changed": []}}])
-        return AnthropicTransport()
+    else:
+        try:
+            transport = _live_transport(args)
+        except (ValueError, TransportError) as exc:
+            print(f"run failed: {exc}", file=sys.stderr)
+            return 2
+
+        def factory(_name: str):
+            return transport
 
     orch = Orchestrator(repo, base=args.base or None, transport_factory=factory,
                         auto_repair_rounds=args.auto_repair, max_workers=args.agents,
@@ -217,6 +274,14 @@ def main(argv=None) -> int:
     p.add_argument("goal", nargs="?"); p.add_argument("--agents", type=int, default=4)
     p.add_argument("--task", action="append", dest="tasks"); p.add_argument("--base", default=None)
     p.add_argument("--auto-repair", type=int, default=2); p.add_argument("--system", default="")
+    p.add_argument("--provider", default=None,
+                   help="openai|groq|openrouter|ollama|lmstudio|anthropic "
+                        "(default: env SWARM_PROVIDER or openai)")
+    p.add_argument("--model", default=None, help="model name (default: per provider)")
+    p.add_argument("--base-url", default=None, help="OpenAI-compatible API root URL")
+    p.add_argument("--api-key", default=None, help="provider API key (or the provider's env var)")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="max output tokens per turn (default: 16384 / provider-safe)")
     p.add_argument("--mock", action="store_true"); p.add_argument("--json", action="store_true")
 
     for name in ("status", "conflicts", "merge", "abort", "log"):

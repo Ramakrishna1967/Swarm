@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
-from .extract import extract_source, file_digest
+from .extract import extract_source, file_digest, module_name_for
 from .models import FileContract, SymbolKey
 from .resolve import Repo
 
@@ -78,13 +79,13 @@ class ContractStore:
                 # keep last good contract; mark dirty
                 self._mark_dirty(agent, path)
                 continue
-            self._cache[(agent, path)] = (file_digest, contract)
+            full = Path(root) / path
+            self._cache[(agent, path)] = (file_digest(full), contract)
             changed.update(contract.definitions.keys())
         if self.on_change and changed:
             self.on_change(agent)
 
     def _extract_file(self, agent: str, path: str, root: str) -> FileContract | None:
-        from pathlib import Path
         full = Path(root) / path
         if not full.exists():
             return None
@@ -92,7 +93,6 @@ class ContractStore:
             source = full.read_text(encoding="utf-8")
         except OSError:
             return None
-        from .extract import module_name_for
         module = module_name_for(full, Path(root))
         return extract_source(source, str(full), module)
 

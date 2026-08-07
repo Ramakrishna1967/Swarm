@@ -73,6 +73,39 @@ def test_orchestrator_detects_broken_caller(tmp_path):
     assert c.symbol == "services.auth:authenticate"
 
 
+def test_one_agent_crash_does_not_abort_run(tmp_path):
+    """§3.1/§5: a crash in one agent's worker must not cancel the run -- the
+    failed agent folds to FAILED, the rest finalize, checkpoint, and the
+    manifest is written complete."""
+    root = _git_repo(tmp_path)
+    scripts = _scripts()
+    orch = Orchestrator(root, run_dir=tmp_path / "runs",
+                        transport_factory=lambda n: MockTransport(scripts.get(n)))
+    orig = orch._drive
+
+    def drive(task):
+        if task.id == "B":
+            raise RuntimeError("boom")
+        return orig(task)
+
+    orch._drive = drive
+
+    out = orch.run([Task(id="A", title="evolve", instructions="add scope"),
+                    Task(id="B", title="caller", instructions="call authenticate")])
+    assert out["results"]["A"].state == "DONE"
+    assert out["results"]["B"].state == "FAILED"
+    # sanity: the run still finalized and wrote a complete manifest
+    manifest = _read_manifest(orch, out["run_id"])
+    assert manifest.get("state") == "complete"
+    assert manifest.get("states", {}).get("B") == "FAILED"
+
+
+def _read_manifest(orch, run_id):
+    import json
+    p = orch.manifest_dir / run_id / "run.json"
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
 def test_checkpoints_then_merge_produces_integration(tmp_path):
     root = _git_repo(tmp_path)
     scripts = _scripts()

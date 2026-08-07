@@ -20,21 +20,22 @@ The orchestrator owns everything the individual runners cannot:
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from .admission import Admission
 from .conflicts import ConflictDetector
 from .events import EventBus
 from .gitops import GitExecutor, Manifest, WorktreeManager
-from .models import Conflict, ConflictKind, FileContract, Repair, RunResult, Shape, SymbolKey, Task
+from .models import Conflict, ConflictKind, FileContract, RunResult, Task
 from .resolve import base_index, build_repo, merged_contract
 from .runner import Agent, RunnerConfig
 from .store import ContractStore
-from .transport import Transport
+from .transport import Transport, TransportError
 
 RUN_DIR_NAME = ".swarm"
 
@@ -123,12 +124,26 @@ class Orchestrator:
         manifest.write(state="active", run_id=run_id, base=self.base,
                        tasks=[t.id for t in tasks])
 
+        self._warmup()
+
         results: dict[str, RunResult] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {pool.submit(self._drive, task): task for task in tasks}
             for fut in as_completed(futures):
                 task = futures[fut]
-                results[task.id] = fut.result()
+                try:
+                    results[task.id] = fut.result()
+                except Exception as exc:
+                    # one agent's crash must never abort the run (§3.1/§5):
+                    # fold the failure, keep going, and let the final
+                    # contracts / checkpoint / manifest still run below.
+                    with self._lock:
+                        self.agent_states[task.id] = "FAILED"
+                    self.event_bus.emit(
+                        "agent_state", agent=task.id, state="FAILED", turn=0,
+                        error=str(exc)[:300],
+                    )
+                    results[task.id] = RunResult(state="FAILED")
 
         self._final_contracts()
         conflicts = self._detect_and_emit()
@@ -176,6 +191,24 @@ class Orchestrator:
             self.agent_states[task.id] = result.state
         return result
 
+    def _warmup(self) -> None:
+        """Cache-warm-then-fan-out (§2.2): fire one cache-warm request against
+        the shared prefix (system prompt + tool list, byte-identical across
+        agents) before the fleet launches, so the concurrent requests hit the
+        cache instead of all missing. A warmup failure never blocks the run --
+        it is an optimization, not a requirement."""
+        by_name = list(self.agents.items())
+        first = next((a for _, a in by_name if a.transport is not None), None)
+        if first is None:
+            return
+        try:
+            first.transport.warmup(
+                [{"role": "system", "content": self.system_prompt}],
+                first.tool_schema(),
+            )
+        except Exception:
+            pass
+
     def _agent_contract(self, worktree: Path):
         repo = build_repo(worktree, self.top)
         touched = self.git.changed_vs_base(worktree, self.base)
@@ -198,7 +231,12 @@ class Orchestrator:
                 # repair injection. The final report must reflect the final
                 # tree, not the last settle boundary.
                 self.settled[name] = self._agent_contract(agent.worktree)
-                if self.agent_states.get(name) not in {"DONE", "EXHAUSTED"}:
+                # A crash/abort is terminal and must not be reported DONE: the
+                # manifest keeps the honest FAILED/ABORTED label even though
+                # its (partial) contract is still folded for detection.
+                if self.agent_states.get(name) in {
+                    "PENDING", "PROVISIONING", "RUNNING", "SETTLING", "THROTTLED",
+                }:
                     self.agent_states[name] = "DONE"
 
     def _detect_and_emit(self) -> list[Conflict]:
@@ -273,8 +311,22 @@ def _build_repair_message(c: Conflict) -> str:
 
 
 def default_transport_factory(_name: str) -> Transport | None:
-    try:
-        from .transport import AnthropicTransport
-        return AnthropicTransport()
-    except Exception:
-        return None
+    """Transport selected from env (SWARM_PROVIDER, *_API_KEY, SWARM_MODEL,
+    SWARM_BASE_URL). Defaults to an OpenAI-compatible endpoint; Anthropic is
+    selected with SWARM_PROVIDER=anthropic."""
+    from .transport import AnthropicTransport, OpenAICompatTransport
+    provider = os.environ.get("SWARM_PROVIDER", "openai").lower()
+    max_tokens = int(os.environ.get("SWARM_MAX_TOKENS") or 16384)
+    if provider == "anthropic":
+        try:
+            return AnthropicTransport(
+                api_key=os.environ.get("ANTHROPIC_API_KEY"), max_tokens=max_tokens,
+            )
+        except TransportError:
+            return None
+    return OpenAICompatTransport(
+        model=os.environ.get("SWARM_MODEL") or "gpt-4o-mini",
+        base_url=os.environ.get("SWARM_BASE_URL") or "https://api.openai.com/v1",
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        max_tokens=max_tokens,
+    )

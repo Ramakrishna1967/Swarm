@@ -12,11 +12,34 @@ Index shape:
 
 from __future__ import annotations
 
-from collections import defaultdict
-from dataclasses import replace
-
-from .models import CallSite, Conflict, ConflictKind, FileContract, Shape, SymbolKey, severity_for
+from .models import CallSite, Conflict, ConflictKind, FileContract, Shape, SymbolKey
 from .shapes import Relation, Verdict, accepts, relation, summarizes
+
+
+def _shape_str(shape: Shape) -> str:
+    """A short human-readable signature for a Shape, §6.2-style
+    (``authenticate`` -> ``(user, scope)``). Self/cls is elided; positional-
+    only, *args / **kwargs and keyword-only params are marked."""
+    slots = list(shape.positional)
+    self_offset = 1 if (shape.implicit_self and slots and slots[0] in ("self", "cls")) else 0
+    slots = slots[self_offset:]
+    posonly = max(shape.posonly_count - self_offset, 0)
+
+    params: list[str] = []
+    for i, name in enumerate(slots):
+        params.append(name)
+        if posonly and i == posonly - 1:
+            params.append("/")
+    if shape.has_varargs:
+        params.append("*args")
+    kw = sorted(set(shape.kwonly_required) | set(shape.kwonly_optional))
+    if kw:
+        if not shape.has_varargs and params and params[-1] not in ("/", "*args"):
+            params.append("*")
+        params.extend(kw)
+    if shape.has_kwargs:
+        params.append("**kwargs")
+    return f"({', '.join(params)})"
 
 
 def build_index(
@@ -42,18 +65,9 @@ def build_index(
     return index, touched
 
 
-def _contributors(
-    index: dict[SymbolKey, dict], key: SymbolKey,
-) -> dict[str, list[CallSite]]:
-    """Map every definer's own name/agent to the call sites it owns for key,
-    plus an empty list for other agents that never call it."""
-    sites = index[key]["callers"]
-    result: dict[str, list[CallSite]] = {}
-    for agent, calls in sites.items():
-        result[agent] = calls
-    for agent in index[key]["definers"]:
-        result.setdefault(agent, [])
-    return result
+def _was_now(old: Shape | None, new: Shape | None) -> tuple[str | None, str | None]:
+    return (_shape_str(old) if old is not None else None,
+            _shape_str(new) if new is not None else None)
 
 
 class ConflictDetector:
@@ -78,6 +92,7 @@ class ConflictDetector:
 
             # --- nothing retained the symbol but callers remain ---------------
             if not definers and old is not None:
+                was, _ = _was_now(old, None)
                 for call in (self.base_callers.get(key, []) +
                              [c for g in entry["callers"].values() for c in g]):
                     conflicts.append(Conflict(
@@ -86,6 +101,7 @@ class ConflictDetector:
                         detail="definition removed while callers remain",
                         severity="medium" if call.in_test else "high",
                         file=call.file, line=call.line,
+                        a=was, b=None,
                     ))
                 continue
 
@@ -107,23 +123,27 @@ class ConflictDetector:
                         continue
                     for call in sites:
                         if accepts(new, call) is Verdict.REJECT:
+                            was, now = _was_now(old, new)
                             conflicts.append(Conflict(
                                 kind=ConflictKind.BROKEN_CALLER,
                                 symbol=str(key), definer=owner, caller=agent,
                                 detail="new definition rejects the call",
                                 severity="medium" if call.in_test else "high",
                                 file=call.file, line=call.line,
+                                a=was, b=now,
                             ))
                 # pre-existing untouched base callers that now break
                 if old is not None:
                     for call in self.base_callers.get(key, []):
                         if accepts(new, call) is Verdict.REJECT:
+                            was, now = _was_now(old, new)
                             conflicts.append(Conflict(
                                 kind=ConflictKind.BROKEN_BASE_CALLER,
                                 symbol=str(key), definer=owner, caller=None,
                                 detail="new definition rejects a base caller",
                                 severity="medium",
                                 file=call.file, line=call.line,
+                                a=was, b=now,
                             ))
                 continue
 
@@ -142,12 +162,18 @@ class ConflictDetector:
                 ))
                 continue
             rels = {relation(a, b) for a in shapes for b in shapes if a is not b}
+            was, _ = _was_now(old, None)
+            if len(uniq) >= 2:
+                a, b = _shape_str(uniq[0]), _shape_str(uniq[1])
+            else:
+                a, b = was, _shape_str(uniq[0])
             if summarizes(shapes[0], shapes[1]):
                 conflicts.append(Conflict(
                     kind=ConflictKind.SUBSUMABLE, symbol=str(key),
                     definer=", ".join(definers), caller=None,
                     detail="a total order exists; pick the most permissive",
                     severity="low",
+                    a=a, b=b,
                 ))
             elif rels <= {Relation.IDENTICAL, Relation.WIDENED, Relation.NARROWED}:
                 conflicts.append(Conflict(
@@ -155,6 +181,7 @@ class ConflictDetector:
                     definer=", ".join(definers), caller=None,
                     detail="compatible direction; a total order exists",
                     severity="low",
+                    a=a, b=b,
                 ))
             else:
                 conflicts.append(Conflict(
@@ -162,6 +189,7 @@ class ConflictDetector:
                     definer=", ".join(definers), caller=None,
                     detail="independent definitions diverge",
                     severity="high",
+                    a=a, b=b,
                 ))
         return conflicts, index
 

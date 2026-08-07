@@ -18,10 +18,7 @@ import os
 import shutil
 import subprocess
 import threading
-import time
 from pathlib import Path
-
-from .models import RunId
 
 
 class GitError(RuntimeError):
@@ -44,15 +41,6 @@ class GitExecutor:
             raise GitError(result.stderr.strip() or "git command failed")
         return result.stdout.strip()
 
-    def run_in(self, worktree: Path, *args: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(worktree), *args],
-            text=True, capture_output=True, shell=False,
-        )
-        if result.returncode:
-            raise GitError(result.stderr.strip() or "git command failed (in worktree)")
-        return result.stdout.strip()
-
     def mutating(self, fn):
         """Execute a git mutating op under the serialization lock."""
         with self._ws:
@@ -65,15 +53,21 @@ class GitExecutor:
         return bool(self.run("status", "--porcelain").strip())
 
     def create_worktree(self, path: Path, branch: str, base: str) -> None:
-        self.run("worktree", "add", "-b", branch, str(path), base)
+        self.mutating(lambda: self.run(
+            "worktree", "add", "-b", branch, str(path), base))
 
     def checkpoint(self, worktree: Path, message: str) -> str:
         """Commit all changes in the worktree onto its checked-out branch."""
-        self._add(worktree)
-        if not self._has_staged(worktree):
+        def _commit_all():
+            # a worktree's index is private, but the ref update (and any
+            # hook this triggers) is shared: serialize it with every other
+            # mutating op.
+            self._add(worktree)
+            if not self._has_staged(worktree):
+                return self.run("-C", str(worktree), "rev-parse", "HEAD")
+            self._commit(worktree, message)
             return self.run("-C", str(worktree), "rev-parse", "HEAD")
-        self._commit(worktree, message)
-        return self.run("-C", str(worktree), "rev-parse", "HEAD")
+        return self.mutating(_commit_all)
 
     def _add(self, worktree: Path) -> None:
         r = subprocess.run(["git", "-C", str(worktree), "add", "--all"],
@@ -139,14 +133,6 @@ class GitExecutor:
                 v = v[len("refs/heads/"):]
             cur[k] = v
         return result
-
-    def merge_branch(self, branch: str, integration: str) -> None:
-        self.mutating(lambda: None)
-        self.run("switch", "-C", integration)
-        self.run("merge", "--no-ff", branch)
-
-    def switch_force(self, branch: str) -> None:
-        self.run("switch", "-C", branch)
 
 
 class Manifest:

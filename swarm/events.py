@@ -15,12 +15,8 @@ from pathlib import Path
 
 
 class EventBus:
-    def __init__(self, path: Path, max_render_buffer: int = 1000) -> None:
+    def __init__(self, path: Path) -> None:
         self.path = path
-        # Render-only events can be dropped under pressure; never contract/conflict.
-        self.dropped = 0
-        self.render_buffer: list[str] = []
-        self.max_render_buffer = max_render_buffer
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Serializes appends: agents emit from their own worker threads, and a
         # torn line is worse than a lost telemetry event.
@@ -29,12 +25,6 @@ class EventBus:
     def emit(self, kind: str, **data: object) -> None:
         record = {"time": time.time(), "kind": kind, **data}
         line = json.dumps(record, sort_keys=True) + "\n"
-        if kind.startswith("render_"):
-            self.render_buffer.append(line)
-            if len(self.render_buffer) > self.max_render_buffer:
-                self.render_buffer.pop(0)
-                self.dropped += 1
-            return
         with self._lock:
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(line)

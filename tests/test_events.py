@@ -17,15 +17,6 @@ def test_emit_and_read_roundtrip(tmp_path):
     assert evs[1]["symbol"] == "m.f"
 
 
-def test_render_events_dropped_under_pressure(tmp_path):
-    bus = EventBus(tmp_path / "e.jsonl", max_render_buffer=2)
-    for i in range(10):
-        bus.emit("render_foo", i=i)
-    assert bus.read() == []
-    assert bus.dropped == 8
-    assert len(bus.render_buffer) == 2
-
-
 def test_fold_status_projection(tmp_path):
     bus = EventBus(tmp_path / "e.jsonl")
     bus.emit("run_started", run_id="r1", base="abc")

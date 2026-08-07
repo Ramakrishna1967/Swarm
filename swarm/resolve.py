@@ -38,8 +38,8 @@ class Repo:
         self.unresolved: list[CallSite] = []
         self.call_sites: list[CallSite] = []
         # Set of dotted module names present in the repo. Used to decide
-        # whether an imported name is repo-local or out-of-repo (see
-        # _follow_local): the repo is the ground truth for what it owns.
+        # whether an imported name is repo-local or out-of-repo: the repo is
+        # the ground truth for what it owns (rule 1 of §2.5).
         self.modules: set[str] = set()
 
     def add(self, contract: FileContract) -> None:
@@ -81,12 +81,6 @@ class Repo:
             cur = nxt
         return None
 
-    def _follow_local(self, key: SymbolKey | None) -> SymbolKey | None:
-        """Resolve a local name to a definition, following re-exports."""
-        if not self._in_repo(key):
-            return None
-        return self._follow_reexport(key)
-
     def resolve(self) -> None:
         """Run resolution across every contract's call sites."""
         for contract in self.contracts:
@@ -111,21 +105,6 @@ class Repo:
                 else:
                     self.unresolved.append(call)
             contract.calls = resolved
-
-    def _follow_local(self, key: SymbolKey | None) -> SymbolKey | None:
-        """Resolve a local name like Key(module=a.b, qualname=g) to a
-        definition, following re-export within the repo.
-
-        A target is dropped (None) when its module is not part of this repo:
-        that is how the stdlib/site-packages name-collision class is killed
-        (rule 1 of §2.5) -- the set of modules we actually indexed *is* the
-        repo, so only modules we scanned can ever be repo-local.
-        """
-        if key is None:
-            return None
-        if key.module in self.modules or key.module in {m.split(".", 1)[0] for m in self.modules}:
-            return self._follow_reexport(key)
-        return None
 
     def _rewrite(self, call: CallSite, key: SymbolKey | None, confidence: str) -> CallSite:
         return CallSite(
