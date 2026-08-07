@@ -195,3 +195,14 @@ def test_merge_into_integration_textual_conflict_is_surfaced(tmp_path):
                                  work_dir=root / ".swarm" / "run1")
     assert rep.merged, rep.merged
     assert rep.errors, rep.errors  # second merge hits the conflict
+
+
+def test_list_worktrees_strips_refs_heads_prefix(tmp_path):
+    root = _git_repo(tmp_path)
+    git_exec = GitExecutor(root)
+    _git(root, "worktree", "add", "-b", "wt_a", str(tmp_path / "wt_a"), "master")
+    wts = git_exec.list_worktrees()
+    branches = {w.get("branch") for w in wts}
+    assert "wt_a" in branches           # not "refs/heads/wt_a"
+    assert "master" in branches         # the checked-out user branch
+    assert all(not b.startswith("refs/heads/") for b in branches if b)

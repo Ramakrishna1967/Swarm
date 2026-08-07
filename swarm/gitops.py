@@ -135,6 +135,8 @@ class GitExecutor:
                     cur = {}
                 continue
             k, _, v = line.partition(" ")
+            if k == "branch" and v.startswith("refs/heads/"):
+                v = v[len("refs/heads/"):]
             cur[k] = v
         return result
 

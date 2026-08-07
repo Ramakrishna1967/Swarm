@@ -159,8 +159,9 @@ def cmd_merge(args) -> int:
 def cmd_doctor(args) -> int:
     from .gitops import GitExecutor, doctor
     repo = Path(args.repo).resolve()
-    wt = repo / _RUN / "worktrees"
-    manifests = sorted(wt.glob("*.json")) if wt.is_dir() else []
+    # worktree manifests live per-run under .swarm/<run>/worktrees/*.json
+    manifests = sorted(p for p in (repo / _RUN).rglob("worktrees/*.json")
+                       if p.is_file())
     lines = doctor(GitExecutor(repo), manifests) or ["ok: (no manifest files)"]
     for line in lines:
         print(line)
