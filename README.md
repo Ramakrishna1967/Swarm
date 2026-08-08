@@ -29,7 +29,7 @@ ship, both built so no third-party package is required:
 
 | Provider | Key env var | Notes |
 |---|---|---|
-| OpenAI | `OPENAI_API_KEY` | default; `gpt-4o-mini` by default |
+| OpenAI | `OPENAI_API_KEY` | default; `gpt-5.6-sol` by default |
 | Groq | `GROQ_API_KEY` | fast llama models |
 | OpenRouter | `OPENROUTER_API_KEY` | one key, many models |
 | Ollama | — (localhost) | keyless, runs locally |
